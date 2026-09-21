@@ -188,7 +188,7 @@ describe.each(['http', 'http2'] as const)(
   '%s cached streaming responses',
   protocol => {
     describe.each(['miss', 'expired'] as const)('%s', cacheStatus => {
-      it.each(['complete', 'disconnect', 'error'] as const)(
+      it.each(['complete', 'disconnect', 'error', 'slow cache write'] as const)(
         'handles %s after delivering the first chunk',
         async outcome => {
           const container = createMemoryStorage<string>(
@@ -199,7 +199,15 @@ describe.each(['http', 'http2'] as const)(
               ? JSON.stringify({ val: 'cached', cursor: Date.now() - 400_000 })
               : undefined;
           if (previous) await container.set('/', previous);
+          const originalSet = container.set.bind(container);
           const setCache = rstest.spyOn(container, 'set');
+          const finishCacheWrite = deferred<void>();
+          if (outcome === 'slow cache write') {
+            setCache.mockImplementation(async (...args) => {
+              await finishCacheWrite.promise;
+              return originalSet(...args);
+            });
+          }
           const cancel = rstest.fn();
           const encoder = new TextEncoder();
           const firstChunk = '<html><body>shell';
@@ -246,7 +254,7 @@ describe.each(['http', 'http2'] as const)(
             expect(response.error).toBeUndefined();
             expect(setCache).not.toHaveBeenCalled();
 
-            if (outcome === 'complete') {
+            if (outcome === 'complete' || outcome === 'slow cache write') {
               controller.enqueue(encoder.encode(lastChunk));
               controller.close();
               sourceFinished = true;
@@ -254,9 +262,17 @@ describe.each(['http', 'http2'] as const)(
               expect(response.body).toBe(firstChunk + lastChunk);
               expect(response.error).toBeUndefined();
               await expect.poll(() => setCache.mock.calls.length).toBe(1);
-              expect(JSON.parse((await container.get('/'))!).val).toBe(
-                firstChunk + lastChunk,
-              );
+              if (outcome === 'slow cache write') {
+                // The HTTP response must finish before cache writing is released.
+                expect(await container.get('/')).toBe(previous);
+                finishCacheWrite.resolve();
+              }
+              await expect
+                .poll(async () => {
+                  const cached = await container.get('/');
+                  return cached ? JSON.parse(cached).val : undefined;
+                })
+                .toBe(firstChunk + lastChunk);
               expect(cancel).not.toHaveBeenCalled();
             } else {
               if (outcome === 'disconnect') {
@@ -276,6 +292,7 @@ describe.each(['http', 'http2'] as const)(
               expect(await container.get('/')).toBe(previous);
             }
           } finally {
+            finishCacheWrite.resolve();
             if (!sourceFinished) controller.close();
             client.dispose();
             await close(server);
